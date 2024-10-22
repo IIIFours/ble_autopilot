@@ -11,31 +11,45 @@ const int UART_TX_PIN = 21;
 
 BLECharacteristic *pCharacteristic;
 
+String inputString = "";
+bool stringComplete = false;
+
 void setup() {
   Serial.begin(9600);
   Serial1.begin(9600, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
-  // BLEDevice::init("BLE Module");
-  // BLEServer *pServer = BLEDevice::createServer();
-  // BLEService *pService = pServer->createService(SERVICE_UUID);
-  // pCharacteristic = pService->createCharacteristic(
-  //                                         CHARACTERISTIC_UUID,
-  //                                         BLECharacteristic::PROPERTY_READ |
-  //                                         BLECharacteristic::PROPERTY_WRITE |
-  //                                         BLECharacteristic::PROPERTY_NOTIFY
-  //                                       );
-  // pService->addCharacteristic(pCharacteristic);
-  // pCharacteristic->setValue("Hello World!");
-  // pService->start();
-  // BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  // pAdvertising->start();
+  inputString.reserve(200);
+  BLEDevice::init("BLE Module");
+  BLEServer *pServer = BLEDevice::createServer();
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  pCharacteristic = pService->createCharacteristic(
+                                          CHARACTERISTIC_UUID,
+                                          BLECharacteristic::PROPERTY_READ |
+                                          BLECharacteristic::PROPERTY_WRITE |
+                                          BLECharacteristic::PROPERTY_NOTIFY
+                                        );
+  pService->addCharacteristic(pCharacteristic);
+  pCharacteristic->setValue("");
+  pService->start();
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->start();
 }
 
 void loop() {
   if (Serial1.available()) {
-    String uartData = Serial1.readString();
-    Serial.println("Received from MCU: " + uartData);
-    pCharacteristic->setValue(uartData.c_str());
-    pCharacteristic->notify();
+    char inChar = (char)Serial1.read();
+    inputString += inChar; 
+    
+    if (inChar == '\n') {
+      stringComplete = true;
+    }
+
+    if (stringComplete) {
+      Serial.println("Received from MCU: " + inputString);
+      pCharacteristic->setValue(inputString.c_str());
+      pCharacteristic->notify();
+      inputString = "";
+      stringComplete = false;
+    }
   }
 
   // if (pCharacteristic->getValue().length() > 0) {
