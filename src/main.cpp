@@ -118,5 +118,5 @@ void loop() {
     // pCharacteristic->setValue("");
   // }
 
-  delay(100);
+  delay(500);
 }
