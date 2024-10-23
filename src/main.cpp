@@ -33,8 +33,25 @@ typedef struct __attribute__((packed)) {
 } Autopilot;
 
 BLECharacteristic *pCharacteristic;
-
+BLEAdvertising* pAdvertising = NULL;
 byte incomingBuffer[sizeof(Autopilot)];
+bool deviceConnected = false;
+
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    Serial.println("Device connected");
+    deviceConnected = true;
+  }
+
+  void onDisconnect(BLEServer* pServer) {
+    Serial.println("Device disconnected");
+    deviceConnected = false;
+    
+    // Restart advertising so the ESP32 can be discovered again
+    pAdvertising->start();
+    Serial.println("Advertising restarted");
+  }
+};
 
 void setup() {
   Serial.begin(921600);
@@ -42,6 +59,7 @@ void setup() {
   BLEDevice::init("BLE Module");
   BLEDevice::setMTU(80);
   BLEServer *pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
   BLEService *pService = pServer->createService(SERVICE_UUID);
   pCharacteristic = pService->createCharacteristic(
                                           CHARACTERISTIC_UUID,
@@ -52,7 +70,8 @@ void setup() {
   pService->addCharacteristic(pCharacteristic);
   pCharacteristic->setValue("");
   pService->start();
-  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
   pAdvertising->start();
 }
 
@@ -71,8 +90,10 @@ void loop() {
       // Deserialize the buffer into the Autopilot struct
       Autopilot* receivedData = (Autopilot*)buffer;
 
-      pCharacteristic->setValue(buffer, sizeof(Autopilot));
-      pCharacteristic->notify();
+      if (deviceConnected) {
+        pCharacteristic->setValue(buffer, sizeof(Autopilot));
+        pCharacteristic->notify();
+      }
 
       Serial.print("kp: ");
       Serial.println(receivedData->kp);
