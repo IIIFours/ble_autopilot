@@ -37,22 +37,23 @@ BLECharacteristic *pCharacteristic;
 byte incomingBuffer[sizeof(Autopilot)];
 
 void setup() {
-  Serial.begin(9600);
-  Serial1.begin(9600, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
-  // BLEDevice::init("BLE Module");
-  // BLEServer *pServer = BLEDevice::createServer();
-  // BLEService *pService = pServer->createService(SERVICE_UUID);
-  // pCharacteristic = pService->createCharacteristic(
-  //                                         CHARACTERISTIC_UUID,
-  //                                         BLECharacteristic::PROPERTY_READ |
-  //                                         BLECharacteristic::PROPERTY_WRITE |
-  //                                         BLECharacteristic::PROPERTY_NOTIFY
-  //                                       );
-  // pService->addCharacteristic(pCharacteristic);
-  // pCharacteristic->setValue("");
-  // pService->start();
-  // BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  // pAdvertising->start();
+  Serial.begin(921600);
+  Serial1.begin(921600, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+  BLEDevice::init("BLE Module");
+  BLEDevice::setMTU(80);
+  BLEServer *pServer = BLEDevice::createServer();
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  pCharacteristic = pService->createCharacteristic(
+                                          CHARACTERISTIC_UUID,
+                                          BLECharacteristic::PROPERTY_READ |
+                                          BLECharacteristic::PROPERTY_WRITE |
+                                          BLECharacteristic::PROPERTY_NOTIFY
+                                        );
+  pService->addCharacteristic(pCharacteristic);
+  pCharacteristic->setValue("");
+  pService->start();
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->start();
 }
 
 void loop() {
@@ -69,6 +70,9 @@ void loop() {
     } else if (incomingByte == 0x03 && bufferIndex == sizeof(Autopilot)) {  // End marker detected
       // Deserialize the buffer into the Autopilot struct
       Autopilot* receivedData = (Autopilot*)buffer;
+
+      pCharacteristic->setValue(buffer, sizeof(Autopilot));
+      pCharacteristic->notify();
 
       Serial.print("kp: ");
       Serial.println(receivedData->kp);
