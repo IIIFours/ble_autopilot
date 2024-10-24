@@ -54,8 +54,8 @@ class MyServerCallbacks : public BLEServerCallbacks {
 };
 
 void setup() {
-  Serial.begin(921600);
-  Serial1.begin(921600, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+  Serial.begin(9600);
+  Serial1.begin(9600, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
   BLEDevice::init("BLE Module");
   BLEDevice::setMTU(80);
   BLEServer *pServer = BLEDevice::createServer();
@@ -79,7 +79,7 @@ void loop() {
   static byte buffer[sizeof(Autopilot)];
   static int bufferIndex = 0;
   bool dataStarted = false;
-  while (Serial1.available() > 0) {
+  while (Serial1.available()) {
     byte incomingByte = Serial1.read();
     if (incomingByte == 0x02) {  // Start marker detected
       bufferIndex = 0;
