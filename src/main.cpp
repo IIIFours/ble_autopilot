@@ -4,7 +4,8 @@
 #include <BLEServer.h>
 
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define AUTOPILOT_CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define PID_CHARACTERISTIC_UUID "98ab29d2-2b95-497d-9df7-f064e5ac05a5"
 
 const int UART_RX_PIN = 20;
 const int UART_TX_PIN = 21;
@@ -32,7 +33,8 @@ typedef struct __attribute__((packed)) {
   bool homingComplete;
 } Autopilot;
 
-BLECharacteristic *pCharacteristic;
+BLECharacteristic *autopilotCharacteristic;
+BLECharacteristic *pidCharacteristic;
 BLEAdvertising* pAdvertising = NULL;
 byte incomingBuffer[sizeof(Autopilot)];
 std::string bleData;
@@ -65,20 +67,29 @@ class MyCallbacks : public BLECharacteristicCallbacks {
 void setup() {
   Serial.begin(9600);
   Serial1.begin(9600, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
-  BLEDevice::init("BLE Module");
+  BLEDevice::init("Autopilot");
   BLEDevice::setMTU(80);
   BLEServer *pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
   BLEService *pService = pServer->createService(SERVICE_UUID);
-  pCharacteristic = pService->createCharacteristic(
-                                          CHARACTERISTIC_UUID,
-                                          BLECharacteristic::PROPERTY_READ |
-                                          BLECharacteristic::PROPERTY_WRITE |
-                                          BLECharacteristic::PROPERTY_NOTIFY
-                                        );
-  pCharacteristic->setCallbacks(new MyCallbacks());
-  pService->addCharacteristic(pCharacteristic);
-  pCharacteristic->setValue("");
+  autopilotCharacteristic = pService->createCharacteristic(
+    AUTOPILOT_CHARACTERISTIC_UUID,
+    BLECharacteristic::PROPERTY_READ |
+    BLECharacteristic::PROPERTY_WRITE |
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pidCharacteristic = pService->createCharacteristic(
+    PID_CHARACTERISTIC_UUID,
+    BLECharacteristic::PROPERTY_READ |
+    BLECharacteristic::PROPERTY_WRITE |
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+  autopilotCharacteristic->setCallbacks(new MyCallbacks());
+  pidCharacteristic->setCallbacks(new MyCallbacks());
+  pService->addCharacteristic(autopilotCharacteristic);
+  pService->addCharacteristic(pidCharacteristic);
+  autopilotCharacteristic->setValue("");
+  pidCharacteristic->setValue("");
   pService->start();
   pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(SERVICE_UUID);
@@ -110,8 +121,8 @@ void loop() {
           Serial1.write(endMarker);
           isWritten = false;
         } else {
-          pCharacteristic->setValue(buffer, sizeof(Autopilot));
-          pCharacteristic->notify();
+          autopilotCharacteristic->setValue(buffer, sizeof(Autopilot));
+          autopilotCharacteristic->notify();
         }
       }
 
