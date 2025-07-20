@@ -1,171 +1,418 @@
+/**
+ * @file main.cpp
+ * @brief ESP32 BLE to UART Bridge for Autopilot System
+ * 
+ * This application acts as a bridge between an iOS device (via BLE) and a 
+ * Teensy 4.0 microcontroller (via UART). It enables remote monitoring and 
+ * control of an autopilot system by forwarding telemetry data and PID parameters.
+ */
+
 #include <Arduino.h>
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEServer.h>
 
-#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define AUTOPILOT_CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
-#define PID_CHARACTERISTIC_UUID "98ab29d2-2b95-497d-9df7-f064e5ac05a5"
+// ============================================================================
+// Constants and Configuration
+// ============================================================================
 
-const int UART_RX_PIN = 20;
-const int UART_TX_PIN = 21;
+// BLE Service and Characteristic UUIDs
+constexpr const char* SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+constexpr const char* AUTOPILOT_CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+constexpr const char* PID_CHARACTERISTIC_UUID = "98ab29d2-2b95-497d-9df7-f064e5ac05a5";
 
+// Hardware Configuration
+constexpr uint8_t UART_RX_PIN = 20;
+constexpr uint8_t UART_TX_PIN = 21;
+constexpr uint32_t SERIAL_BAUD_RATE = 9600;
+constexpr uint32_t DEBUG_BAUD_RATE = 115200;
+
+// Communication Protocol
+constexpr uint8_t PACKET_START_MARKER = 0x02;
+constexpr uint8_t PACKET_END_MARKER = 0x03;
+
+// BLE Configuration
+constexpr const char* DEVICE_NAME = "Autopilot";
+constexpr uint16_t BLE_MTU_SIZE = 80;
+
+// Timing Configuration
+constexpr uint32_t LOOP_DELAY_MS = 10;  // Reduced from 500ms for better responsiveness
+constexpr uint32_t MAX_PACKET_TIMEOUT_MS = 1000;
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+/**
+ * @brief Telemetry data structure for autopilot communication
+ * 
+ * This packed structure must match exactly between ESP32 and Teensy.
+ * Any changes require updating both devices.
+ */
 typedef struct __attribute__((packed)) {
+  // PID Controller Parameters
   float kp;
   float ki;
   float kd;
-  float bearingPositionToDestinationWaypoint;
+  float heading_gain;
+  
+  // Navigation Data
+  float bearingToWaypoint;
   float destinationLatitude;
   float destinationLongitude;
   float previousDestinationLatitude;
   float previousDestinationLongitude;
   float heading;
+  
+  // Cross Track Error
   float xte;
+  float filteredHeading;
+  float filteredXTE;
   float previousXte;
   float previousTime;
   float previousBearing;
   float integralXTE;
   float derivativeXTE;
   float timeDelta;
+  
+  // Control Outputs
   float rudderAngle;
   float rudderPosition;
   float targetMotorPosition;
+  float headingCorrection;
+  
+  // Status
   bool homingComplete;
-} Autopilot;
+} AutopilotTelemetry;
 
-BLECharacteristic *autopilotCharacteristic;
-BLECharacteristic *pidCharacteristic;
-BLEAdvertising* pAdvertising = NULL;
-byte incomingBuffer[sizeof(Autopilot)];
-std::string bleData;
-bool deviceConnected = false;
-bool isWritten = false;
-byte startMarker = 0x02;
-byte endMarker = 0x03;
+// ============================================================================
+// Global Variables
+// ============================================================================
 
-class MyServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* pServer) {
-    Serial.println("Device connected");
-    deviceConnected = true;
+// BLE Objects
+static BLECharacteristic* g_autopilotCharacteristic = nullptr;
+static BLECharacteristic* g_pidCharacteristic = nullptr;
+static BLEAdvertising* g_advertising = nullptr;
+static BLEServer* g_bleServer = nullptr;
+
+// Connection State
+static volatile bool g_deviceConnected = false;
+static volatile bool g_previouslyConnected = false;
+
+// Data Communication
+static volatile bool g_dataWritePending = false;
+static std::string g_pendingBleData;
+
+// Serial Communication Buffer
+static uint8_t g_serialBuffer[sizeof(AutopilotTelemetry)];
+static size_t g_bufferIndex = 0;
+static bool g_packetInProgress = false;
+static uint32_t g_packetStartTime = 0;
+
+// ============================================================================
+// BLE Callbacks
+// ============================================================================
+
+/**
+ * @brief BLE Server connection callbacks
+ */
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) override {
+    Serial.println("[BLE] Device connected");
+    g_deviceConnected = true;
   }
 
-  void onDisconnect(BLEServer* pServer) {
-    Serial.println("Device disconnected");
-    deviceConnected = false;
-    pAdvertising->start();
-    Serial.println("Advertising restarted");
+  void onDisconnect(BLEServer* pServer) override {
+    Serial.println("[BLE] Device disconnected");
+    g_deviceConnected = false;
   }
 };
 
-class MyCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *pCharacteristic) {
-    bleData = pCharacteristic->getValue();
-    isWritten = true;
+/**
+ * @brief BLE Characteristic write callbacks
+ */
+class CharacteristicCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pCharacteristic) override {
+    g_pendingBleData = pCharacteristic->getValue();
+    g_dataWritePending = true;
+    Serial.println("[BLE] Data received from client");
   }
 };
 
-void setup() {
-  Serial.begin(9600);
-  Serial1.begin(9600, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
-  BLEDevice::init("Autopilot");
-  BLEDevice::setMTU(80);
-  BLEServer *pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new MyServerCallbacks());
-  BLEService *pService = pServer->createService(SERVICE_UUID);
-  autopilotCharacteristic = pService->createCharacteristic(
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+/**
+ * @brief Log telemetry data in a formatted way
+ * @param data Pointer to telemetry data structure
+ */
+void logTelemetryData(const AutopilotTelemetry* data) {
+  if (!data) return;
+  
+  Serial.println("\n========== Telemetry Data ==========");
+  
+  Serial.println("-- PID Parameters --");
+  Serial.printf("  kp: %.4f, ki: %.4f, kd: %.4f\n", data->kp, data->ki, data->kd);
+  
+  Serial.println("\n-- Navigation --");
+  Serial.printf("  Destination: %.6f, %.6f\n", data->destinationLatitude, data->destinationLongitude);
+  Serial.printf("  Bearing to Waypoint: %.2f°\n", data->bearingToWaypoint);
+  Serial.printf("  Heading: %.2f° (Filtered: %.2f°)\n", data->heading, data->filteredHeading);
+  Serial.printf("  Heading Gain: %.4f\n", data->heading_gain);
+  
+  Serial.println("\n-- Cross Track Error --");
+  Serial.printf("  XTE: %.2f (Filtered: %.2f)\n", data->xte, data->filteredXTE);
+  Serial.printf("  Previous XTE: %.2f\n", data->previousXte);
+  Serial.printf("  Integral XTE: %.4f, Derivative XTE: %.4f\n", data->integralXTE, data->derivativeXTE);
+  
+  Serial.println("\n-- Control Output --");
+  Serial.printf("  Rudder Angle: %.2f°, Position: %.2f\n", data->rudderAngle, data->rudderPosition);
+  Serial.printf("  Target Motor Position: %.2f\n", data->targetMotorPosition);
+  Serial.printf("  Heading Correction: %.2f°\n", data->headingCorrection);
+  
+  Serial.println("\n-- Status --");
+  Serial.printf("  Homing Complete: %s\n", data->homingComplete ? "Yes" : "No");
+  Serial.printf("  Time Delta: %.3fs\n", data->timeDelta);
+  
+  Serial.println("====================================\n");
+}
+
+/**
+ * @brief Initialize serial communication
+ */
+void initializeSerial() {
+  Serial.begin(DEBUG_BAUD_RATE);
+  while (!Serial && millis() < 3000) {
+    delay(10);  // Wait for serial port to connect (max 3 seconds)
+  }
+  
+  Serial1.begin(SERIAL_BAUD_RATE, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+  
+  Serial.println("\n[SYSTEM] ESP32 BLE-UART Bridge Starting...");
+  Serial.printf("[SYSTEM] Debug Port: %d baud\n", DEBUG_BAUD_RATE);
+  Serial.printf("[SYSTEM] Teensy Port: %d baud (RX:%d, TX:%d)\n", 
+                SERIAL_BAUD_RATE, UART_RX_PIN, UART_TX_PIN);
+}
+
+/**
+ * @brief Initialize BLE server and services
+ * @return true if initialization successful, false otherwise
+ */
+bool initializeBLE() {
+  Serial.println("[BLE] Initializing BLE...");
+  
+  // Initialize BLE Device
+  BLEDevice::init(DEVICE_NAME);
+  
+  // Set MTU for larger data packets
+  if (!BLEDevice::setMTU(BLE_MTU_SIZE)) {
+    Serial.println("[BLE] Warning: Failed to set MTU size");
+  }
+  
+  // Create BLE Server
+  g_bleServer = BLEDevice::createServer();
+  if (!g_bleServer) {
+    Serial.println("[BLE] Error: Failed to create BLE server");
+    return false;
+  }
+  g_bleServer->setCallbacks(new ServerCallbacks());
+  
+  // Create BLE Service
+  BLEService* pService = g_bleServer->createService(SERVICE_UUID);
+  if (!pService) {
+    Serial.println("[BLE] Error: Failed to create BLE service");
+    return false;
+  }
+  
+  // Create Autopilot Telemetry Characteristic
+  g_autopilotCharacteristic = pService->createCharacteristic(
     AUTOPILOT_CHARACTERISTIC_UUID,
     BLECharacteristic::PROPERTY_READ |
-    BLECharacteristic::PROPERTY_WRITE |
     BLECharacteristic::PROPERTY_NOTIFY
   );
-  pidCharacteristic = pService->createCharacteristic(
+  if (!g_autopilotCharacteristic) {
+    Serial.println("[BLE] Error: Failed to create autopilot characteristic");
+    return false;
+  }
+  
+  // Create PID Control Characteristic
+  g_pidCharacteristic = pService->createCharacteristic(
     PID_CHARACTERISTIC_UUID,
     BLECharacteristic::PROPERTY_READ |
-    BLECharacteristic::PROPERTY_WRITE |
-    BLECharacteristic::PROPERTY_NOTIFY
+    BLECharacteristic::PROPERTY_WRITE
   );
-  autopilotCharacteristic->setCallbacks(new MyCallbacks());
-  pidCharacteristic->setCallbacks(new MyCallbacks());
-  pService->addCharacteristic(autopilotCharacteristic);
-  pService->addCharacteristic(pidCharacteristic);
-  autopilotCharacteristic->setValue("");
-  pidCharacteristic->setValue("");
+  if (!g_pidCharacteristic) {
+    Serial.println("[BLE] Error: Failed to create PID characteristic");
+    return false;
+  }
+  
+  // Set callbacks
+  g_pidCharacteristic->setCallbacks(new CharacteristicCallbacks());
+  
+  // Initialize characteristic values
+  uint8_t emptyData[1] = {0};
+  g_autopilotCharacteristic->setValue(emptyData, 1);
+  g_pidCharacteristic->setValue(emptyData, 1);
+  
+  // Start the service
   pService->start();
-  pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(SERVICE_UUID);
-  pAdvertising->start();
+  
+  // Start advertising
+  g_advertising = BLEDevice::getAdvertising();
+  g_advertising->addServiceUUID(SERVICE_UUID);
+  g_advertising->setScanResponse(true);
+  g_advertising->setMinPreferred(0x06);  // Functions that help with iPhone connections issue
+  g_advertising->setMinPreferred(0x12);
+  g_advertising->start();
+  
+  Serial.println("[BLE] BLE initialized successfully");
+  Serial.printf("[BLE] Device name: %s\n", DEVICE_NAME);
+  Serial.println("[BLE] Advertising started");
+  
+  return true;
+}
+
+/**
+ * @brief Forward BLE data to Teensy via UART
+ */
+void forwardBleDataToTeensy() {
+  if (!g_dataWritePending || g_pendingBleData.empty()) {
+    return;
+  }
+  
+  Serial.printf("[UART] Forwarding %d bytes to Teensy\n", g_pendingBleData.length());
+  
+  Serial1.write(PACKET_START_MARKER);
+  for (size_t i = 0; i < g_pendingBleData.length(); i++) {
+    Serial1.write(g_pendingBleData[i]);
+  }
+  Serial1.write(PACKET_END_MARKER);
+  
+  g_dataWritePending = false;
+  g_pendingBleData.clear();
+}
+
+/**
+ * @brief Process incoming serial data and handle complete packets
+ * @return true if a complete packet was processed
+ */
+bool processSerialData() {
+  static uint32_t lastDataTime = millis();
+  bool packetProcessed = false;
+  
+  while (Serial1.available()) {
+    uint8_t incomingByte = Serial1.read();
+    lastDataTime = millis();
+    
+    if (incomingByte == PACKET_START_MARKER) {
+      // Start of new packet
+      g_bufferIndex = 0;
+      g_packetInProgress = true;
+      g_packetStartTime = millis();
+      continue;
+    }
+    
+    if (!g_packetInProgress) {
+      continue;  // Ignore data outside of packet markers
+    }
+    
+    if (incomingByte == PACKET_END_MARKER) {
+      // End of packet - validate and process
+      if (g_bufferIndex == sizeof(AutopilotTelemetry)) {
+        // Valid packet received
+        const AutopilotTelemetry* telemetry = reinterpret_cast<const AutopilotTelemetry*>(g_serialBuffer);
+        
+        // Forward to BLE if connected
+        if (g_deviceConnected && g_autopilotCharacteristic) {
+          g_autopilotCharacteristic->setValue(g_serialBuffer, sizeof(AutopilotTelemetry));
+          g_autopilotCharacteristic->notify();
+        }
+        
+        // Log telemetry data
+        logTelemetryData(telemetry);
+        packetProcessed = true;
+      } else {
+        Serial.printf("[UART] Warning: Invalid packet size (%d bytes, expected %d)\n", 
+                      g_bufferIndex, sizeof(AutopilotTelemetry));
+      }
+      
+      g_packetInProgress = false;
+      g_bufferIndex = 0;
+      continue;
+    }
+    
+    // Add byte to buffer
+    if (g_bufferIndex < sizeof(g_serialBuffer)) {
+      g_serialBuffer[g_bufferIndex++] = incomingByte;
+    } else {
+      // Buffer overflow - reset
+      Serial.println("[UART] Error: Buffer overflow, resetting");
+      g_packetInProgress = false;
+      g_bufferIndex = 0;
+    }
+  }
+  
+  // Check for packet timeout
+  if (g_packetInProgress && (millis() - g_packetStartTime > MAX_PACKET_TIMEOUT_MS)) {
+    Serial.println("[UART] Warning: Packet timeout, resetting buffer");
+    g_packetInProgress = false;
+    g_bufferIndex = 0;
+  }
+  
+  return packetProcessed;
+}
+
+/**
+ * @brief Handle BLE connection state changes
+ */
+void handleConnectionStateChange() {
+  // Device just connected
+  if (g_deviceConnected && !g_previouslyConnected) {
+    g_previouslyConnected = g_deviceConnected;
+    Serial.println("[BLE] Connection established");
+  }
+  
+  // Device just disconnected
+  if (!g_deviceConnected && g_previouslyConnected) {
+    delay(100);  // Give BLE stack time to clean up
+    g_advertising->start();  // Restart advertising
+    g_previouslyConnected = g_deviceConnected;
+    Serial.println("[BLE] Restarted advertising");
+  }
+}
+
+// ============================================================================
+// Main Functions
+// ============================================================================
+
+void setup() {
+  // Initialize serial communication
+  initializeSerial();
+  
+  // Initialize BLE
+  if (!initializeBLE()) {
+    Serial.println("[SYSTEM] FATAL: BLE initialization failed!");
+    Serial.println("[SYSTEM] Entering error state...");
+    while (true) {
+      delay(1000);
+      Serial.println("[SYSTEM] BLE initialization failed - restart required");
+    }
+  }
+  
+  Serial.println("[SYSTEM] Setup complete - entering main loop");
 }
 
 void loop() {
-  static byte buffer[sizeof(Autopilot)];
-  static int bufferIndex = 0;
-  bool dataStarted = false;
-
-  while (Serial1.available()) {
-    byte incomingByte = Serial1.read();
-    if (incomingByte == startMarker) {  // Start marker detected
-      bufferIndex = 0;
-      dataStarted = true;
-    } else if (dataStarted && bufferIndex < sizeof(Autopilot)) {
-      buffer[bufferIndex++] = incomingByte;
-    } else if (incomingByte == endMarker && bufferIndex == sizeof(Autopilot)) {  // End marker detected
-      // Deserialize the buffer into the Autopilot struct
-      Autopilot* receivedData = (Autopilot*)buffer;
-
-      if (deviceConnected) {
-        if (isWritten) {
-          Serial1.write(startMarker);
-          for (int i = 0; i < bleData.length(); i++) {
-            Serial1.write(bleData[i]);
-          }
-          Serial1.write(endMarker);
-          isWritten = false;
-        } else {
-          autopilotCharacteristic->setValue(buffer, sizeof(Autopilot));
-          autopilotCharacteristic->notify();
-        }
-      }
-
-      Serial.print("kp: ");
-      Serial.println(receivedData->kp);
-      Serial.print("ki: ");
-      Serial.println(receivedData->ki);
-      Serial.print("kd: ");
-      Serial.println(receivedData->kd);
-      Serial.print("destinationLatitude: ");
-      Serial.println(receivedData->destinationLatitude);
-      Serial.print("destinationLongitude: ");
-      Serial.println(receivedData->destinationLongitude);
-      Serial.print("bearingPositionToDestinationWaypoint: ");
-      Serial.println(receivedData->bearingPositionToDestinationWaypoint);
-      Serial.print("heading: ");
-      Serial.println(receivedData->heading);
-      Serial.print("xte: ");
-      Serial.println(receivedData->xte);
-      Serial.print("previousXte: ");
-      Serial.println(receivedData->previousXte);
-      Serial.print("previousTime: ");
-      Serial.println(receivedData->previousTime);
-      Serial.print("previousBearing: ");
-      Serial.println(receivedData->previousBearing);
-      Serial.print("integralXTE: ");
-      Serial.println(receivedData->integralXTE);
-      Serial.print("derivativeXTE: ");
-      Serial.println(receivedData->derivativeXTE);
-      Serial.print("timeDelta: ");
-      Serial.println(receivedData->timeDelta);
-      Serial.print("rudderAngle: ");
-      Serial.println(receivedData->rudderAngle);
-      Serial.print("rudderPosition: ");
-      Serial.println(receivedData->rudderPosition);
-      Serial.print("targetMotorPosition: ");
-      Serial.println(receivedData->targetMotorPosition);
-      Serial.println("==================================");
-
-      bufferIndex = 0;
-      dataStarted = false;
-    }
-  }
-
-  delay(500);
+  // Handle BLE connection state changes
+  handleConnectionStateChange();
+  
+  // Forward any pending BLE data to Teensy
+  forwardBleDataToTeensy();
+  
+  // Process incoming serial data from Teensy
+  processSerialData();
+  
+  // Small delay to prevent CPU hogging
+  delay(LOOP_DELAY_MS);
 }
