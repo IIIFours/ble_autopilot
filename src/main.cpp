@@ -50,10 +50,19 @@ constexpr uint32_t UART_TASK_PRIORITY = 2;
 constexpr uint32_t BLE_TASK_PRIORITY = 1;
 constexpr uint32_t QUEUE_SIZE = 10;
 constexpr uint32_t QUEUE_WAIT_MS = 10;
+constexpr size_t MAX_BLE_DATA_SIZE = 512;  // Maximum size for BLE data
 
 // ============================================================================
 // Data Structures
 // ============================================================================
+
+/**
+ * @brief Structure for BLE data queue items
+ */
+typedef struct {
+  uint8_t data[MAX_BLE_DATA_SIZE];
+  size_t length;
+} BleDataQueueItem;
 
 /**
  * @brief Telemetry data structure for autopilot communication
@@ -106,14 +115,12 @@ static BLECharacteristic* g_autopilotCharacteristic = nullptr;
 static BLECharacteristic* g_pidCharacteristic = nullptr;
 static BLEAdvertising* g_advertising = nullptr;
 static BLEServer* g_bleServer = nullptr;
+static ServerCallbacks* g_serverCallbacks = nullptr;
+static CharacteristicCallbacks* g_characteristicCallbacks = nullptr;
 
 // Connection State
 static volatile bool g_deviceConnected = false;
 static volatile bool g_previouslyConnected = false;
-
-// Data Communication
-static volatile bool g_dataWritePending = false;
-static std::string g_pendingBleData;
 
 // FreeRTOS Objects
 static QueueHandle_t g_teensyToBleQueue = nullptr;
@@ -125,6 +132,10 @@ static uint8_t g_serialBuffer[sizeof(AutopilotTelemetry)];
 static size_t g_bufferIndex = 0;
 static bool g_packetInProgress = false;
 static uint32_t g_packetStartTime = 0;
+
+// Compile-time assertion to ensure buffer size matches telemetry structure
+static_assert(sizeof(g_serialBuffer) == sizeof(AutopilotTelemetry), 
+              "Serial buffer size must match AutopilotTelemetry structure size");
 
 // ============================================================================
 // BLE Callbacks
@@ -151,10 +162,21 @@ class ServerCallbacks : public BLEServerCallbacks {
 class CharacteristicCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* pCharacteristic) override {
     std::string data = pCharacteristic->getValue();
-    if (data.length() > 0 && g_bleToTeensyQueue) {
+    if (data.length() > 0 && data.length() <= MAX_BLE_DATA_SIZE && g_bleToTeensyQueue) {
+      // Prepare queue item
+      BleDataQueueItem queueItem;
+      memcpy(queueItem.data, data.c_str(), data.length());
+      queueItem.length = data.length();
+      
       // Send data to queue for UART task to process
-      xQueueSend(g_bleToTeensyQueue, &data, 0);
-      Serial.println("[BLE] Data received from client and queued");
+      if (xQueueSend(g_bleToTeensyQueue, &queueItem, 0) == pdTRUE) {
+        Serial.println("[BLE] Data received from client and queued");
+      } else {
+        Serial.println("[BLE] Warning: Queue full, data dropped");
+      }
+    } else if (data.length() > MAX_BLE_DATA_SIZE) {
+      Serial.printf("[BLE] Error: Data too large (%d bytes, max %d)\n", 
+                    data.length(), MAX_BLE_DATA_SIZE);
     }
   }
 };
@@ -199,6 +221,20 @@ void logTelemetryData(const AutopilotTelemetry* data) {
 }
 
 /**
+ * @brief Clean up dynamically allocated BLE objects
+ */
+void cleanupBLE() {
+  if (g_serverCallbacks) {
+    delete g_serverCallbacks;
+    g_serverCallbacks = nullptr;
+  }
+  if (g_characteristicCallbacks) {
+    delete g_characteristicCallbacks;
+    g_characteristicCallbacks = nullptr;
+  }
+}
+
+/**
  * @brief Initialize serial communication
  */
 void initializeSerial() {
@@ -236,7 +272,8 @@ bool initializeBLE() {
     Serial.println("[BLE] Error: Failed to create BLE server");
     return false;
   }
-  g_bleServer->setCallbacks(new ServerCallbacks());
+  g_serverCallbacks = new ServerCallbacks();
+  g_bleServer->setCallbacks(g_serverCallbacks);
   
   // Create BLE Service
   BLEService* pService = g_bleServer->createService(SERVICE_UUID);
@@ -268,7 +305,8 @@ bool initializeBLE() {
   }
   
   // Set callbacks
-  g_pidCharacteristic->setCallbacks(new CharacteristicCallbacks());
+  g_characteristicCallbacks = new CharacteristicCallbacks();
+  g_pidCharacteristic->setCallbacks(g_characteristicCallbacks);
   
   // Initialize characteristic values
   uint8_t emptyData[1] = {0};
@@ -282,8 +320,7 @@ bool initializeBLE() {
   g_advertising = BLEDevice::getAdvertising();
   g_advertising->addServiceUUID(SERVICE_UUID);
   g_advertising->setScanResponse(true);
-  g_advertising->setMinPreferred(0x06);  // Functions that help with iPhone connections issue
-  g_advertising->setMinPreferred(0x12);
+  g_advertising->setMinPreferred(0x12);  // Functions that help with iPhone connections issue
   g_advertising->start();
   
   Serial.println("[BLE] BLE initialized successfully");
@@ -298,6 +335,13 @@ bool initializeBLE() {
  */
 void forwardBleDataToTeensy(const std::string& data) {
   if (data.empty()) {
+    return;
+  }
+  
+  // Safety check for data size
+  if (data.length() > MAX_BLE_DATA_SIZE) {
+    Serial.printf("[UART] Error: Data too large to forward (%d bytes, max %d)\n", 
+                  data.length(), MAX_BLE_DATA_SIZE);
     return;
   }
   
@@ -415,8 +459,10 @@ void uartTask(void* parameter) {
     processSerialData();
     
     // Check for data to send to Teensy
-    std::string dataToSend;
-    if (xQueueReceive(g_bleToTeensyQueue, &dataToSend, 0) == pdTRUE) {
+    BleDataQueueItem queueItem;
+    if (xQueueReceive(g_bleToTeensyQueue, &queueItem, 0) == pdTRUE) {
+      // Convert queue item to string for forwarding
+      std::string dataToSend(reinterpret_cast<const char*>(queueItem.data), queueItem.length);
       forwardBleDataToTeensy(dataToSend);
     }
     
@@ -464,6 +510,7 @@ void setup() {
   if (!initializeBLE()) {
     Serial.println("[SYSTEM] FATAL: BLE initialization failed!");
     Serial.println("[SYSTEM] Entering error state...");
+    cleanupBLE();  // Clean up any partially allocated resources
     while (true) {
       delay(1000);
       Serial.println("[SYSTEM] BLE initialization failed - restart required");
@@ -472,7 +519,7 @@ void setup() {
   
   // Create FreeRTOS queues
   g_teensyToBleQueue = xQueueCreate(QUEUE_SIZE, sizeof(AutopilotTelemetry));
-  g_bleToTeensyQueue = xQueueCreate(QUEUE_SIZE, sizeof(std::string));
+  g_bleToTeensyQueue = xQueueCreate(QUEUE_SIZE, sizeof(BleDataQueueItem));
   
   if (!g_teensyToBleQueue || !g_bleToTeensyQueue) {
     Serial.println("[SYSTEM] FATAL: Failed to create queues!");
