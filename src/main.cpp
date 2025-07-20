@@ -11,6 +11,10 @@
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEServer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
 
 // ============================================================================
 // Constants and Configuration
@@ -38,6 +42,14 @@ constexpr uint16_t BLE_MTU_SIZE = 80;
 // Timing Configuration
 constexpr uint32_t LOOP_DELAY_MS = 10;  // Reduced from 500ms for better responsiveness
 constexpr uint32_t MAX_PACKET_TIMEOUT_MS = 1000;
+
+// FreeRTOS Configuration
+constexpr uint32_t UART_TASK_STACK_SIZE = 4096;
+constexpr uint32_t BLE_TASK_STACK_SIZE = 4096;
+constexpr uint32_t UART_TASK_PRIORITY = 2;
+constexpr uint32_t BLE_TASK_PRIORITY = 1;
+constexpr uint32_t QUEUE_SIZE = 10;
+constexpr uint32_t QUEUE_WAIT_MS = 10;
 
 // ============================================================================
 // Data Structures
@@ -103,6 +115,11 @@ static volatile bool g_previouslyConnected = false;
 static volatile bool g_dataWritePending = false;
 static std::string g_pendingBleData;
 
+// FreeRTOS Objects
+static QueueHandle_t g_teensyToBleQueue = nullptr;
+static QueueHandle_t g_bleToTeensyQueue = nullptr;
+static SemaphoreHandle_t g_bleDataMutex = nullptr;
+
 // Serial Communication Buffer
 static uint8_t g_serialBuffer[sizeof(AutopilotTelemetry)];
 static size_t g_bufferIndex = 0;
@@ -133,9 +150,12 @@ class ServerCallbacks : public BLEServerCallbacks {
  */
 class CharacteristicCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* pCharacteristic) override {
-    g_pendingBleData = pCharacteristic->getValue();
-    g_dataWritePending = true;
-    Serial.println("[BLE] Data received from client");
+    std::string data = pCharacteristic->getValue();
+    if (data.length() > 0 && g_bleToTeensyQueue) {
+      // Send data to queue for UART task to process
+      xQueueSend(g_bleToTeensyQueue, &data, 0);
+      Serial.println("[BLE] Data received from client and queued");
+    }
   }
 };
 
@@ -274,23 +294,20 @@ bool initializeBLE() {
 }
 
 /**
- * @brief Forward BLE data to Teensy via UART
+ * @brief Forward BLE data to Teensy via UART (called from UART task)
  */
-void forwardBleDataToTeensy() {
-  if (!g_dataWritePending || g_pendingBleData.empty()) {
+void forwardBleDataToTeensy(const std::string& data) {
+  if (data.empty()) {
     return;
   }
   
-  Serial.printf("[UART] Forwarding %d bytes to Teensy\n", g_pendingBleData.length());
+  Serial.printf("[UART] Forwarding %d bytes to Teensy\n", data.length());
   
   Serial1.write(PACKET_START_MARKER);
-  for (size_t i = 0; i < g_pendingBleData.length(); i++) {
-    Serial1.write(g_pendingBleData[i]);
+  for (size_t i = 0; i < data.length(); i++) {
+    Serial1.write(data[i]);
   }
   Serial1.write(PACKET_END_MARKER);
-  
-  g_dataWritePending = false;
-  g_pendingBleData.clear();
 }
 
 /**
@@ -323,10 +340,11 @@ bool processSerialData() {
         // Valid packet received
         const AutopilotTelemetry* telemetry = reinterpret_cast<const AutopilotTelemetry*>(g_serialBuffer);
         
-        // Forward to BLE if connected
-        if (g_deviceConnected && g_autopilotCharacteristic) {
-          g_autopilotCharacteristic->setValue(g_serialBuffer, sizeof(AutopilotTelemetry));
-          g_autopilotCharacteristic->notify();
+        // Forward to BLE task via queue
+        if (g_teensyToBleQueue) {
+          AutopilotTelemetry telemetryData;
+          memcpy(&telemetryData, g_serialBuffer, sizeof(AutopilotTelemetry));
+          xQueueSend(g_teensyToBleQueue, &telemetryData, 0);
         }
         
         // Log telemetry data
@@ -383,6 +401,58 @@ void handleConnectionStateChange() {
 }
 
 // ============================================================================
+// FreeRTOS Task Functions
+// ============================================================================
+
+/**
+ * @brief UART task - handles serial communication with Teensy
+ */
+void uartTask(void* parameter) {
+  Serial.println("[TASK] UART task started");
+  
+  while (true) {
+    // Process incoming serial data from Teensy
+    processSerialData();
+    
+    // Check for data to send to Teensy
+    std::string dataToSend;
+    if (xQueueReceive(g_bleToTeensyQueue, &dataToSend, 0) == pdTRUE) {
+      forwardBleDataToTeensy(dataToSend);
+    }
+    
+    // Small delay to prevent CPU hogging
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
+/**
+ * @brief BLE task - handles BLE notifications
+ */
+void bleTask(void* parameter) {
+  Serial.println("[TASK] BLE task started");
+  
+  while (true) {
+    // Handle connection state changes
+    handleConnectionStateChange();
+    
+    // Check for telemetry data to send via BLE
+    AutopilotTelemetry telemetryData;
+    if (xQueueReceive(g_teensyToBleQueue, &telemetryData, pdMS_TO_TICKS(QUEUE_WAIT_MS)) == pdTRUE) {
+      if (g_deviceConnected && g_autopilotCharacteristic) {
+        if (xSemaphoreTake(g_bleDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          g_autopilotCharacteristic->setValue((uint8_t*)&telemetryData, sizeof(AutopilotTelemetry));
+          g_autopilotCharacteristic->notify();
+          xSemaphoreGive(g_bleDataMutex);
+        }
+      }
+    }
+    
+    // Small delay to prevent CPU hogging
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// ============================================================================
 // Main Functions
 // ============================================================================
 
@@ -400,19 +470,60 @@ void setup() {
     }
   }
   
-  Serial.println("[SYSTEM] Setup complete - entering main loop");
+  // Create FreeRTOS queues
+  g_teensyToBleQueue = xQueueCreate(QUEUE_SIZE, sizeof(AutopilotTelemetry));
+  g_bleToTeensyQueue = xQueueCreate(QUEUE_SIZE, sizeof(std::string));
+  
+  if (!g_teensyToBleQueue || !g_bleToTeensyQueue) {
+    Serial.println("[SYSTEM] FATAL: Failed to create queues!");
+    while (true) {
+      delay(1000);
+      Serial.println("[SYSTEM] Queue creation failed - restart required");
+    }
+  }
+  
+  // Create mutex for BLE data protection
+  g_bleDataMutex = xSemaphoreCreateMutex();
+  if (!g_bleDataMutex) {
+    Serial.println("[SYSTEM] FATAL: Failed to create mutex!");
+    while (true) {
+      delay(1000);
+      Serial.println("[SYSTEM] Mutex creation failed - restart required");
+    }
+  }
+  
+  // Create FreeRTOS tasks
+  BaseType_t uartTaskCreated = xTaskCreate(
+    uartTask,                 // Task function
+    "UART_Task",             // Task name
+    UART_TASK_STACK_SIZE,    // Stack size
+    nullptr,                 // Parameters
+    UART_TASK_PRIORITY,      // Priority
+    nullptr                  // Task handle
+  );
+  
+  BaseType_t bleTaskCreated = xTaskCreate(
+    bleTask,                 // Task function
+    "BLE_Task",             // Task name
+    BLE_TASK_STACK_SIZE,    // Stack size
+    nullptr,                // Parameters
+    BLE_TASK_PRIORITY,      // Priority
+    nullptr                 // Task handle
+  );
+  
+  if (uartTaskCreated != pdPASS || bleTaskCreated != pdPASS) {
+    Serial.println("[SYSTEM] FATAL: Failed to create tasks!");
+    while (true) {
+      delay(1000);
+      Serial.println("[SYSTEM] Task creation failed - restart required");
+    }
+  }
+  
+  Serial.println("[SYSTEM] Setup complete - FreeRTOS tasks started");
 }
 
 void loop() {
-  // Handle BLE connection state changes
-  handleConnectionStateChange();
-  
-  // Forward any pending BLE data to Teensy
-  forwardBleDataToTeensy();
-  
-  // Process incoming serial data from Teensy
-  processSerialData();
-  
-  // Small delay to prevent CPU hogging
-  delay(LOOP_DELAY_MS);
+  // Main loop is now empty - all work is done in FreeRTOS tasks
+  // This is required by Arduino framework but we don't use it
+  vTaskDelay(pdMS_TO_TICKS(1000));  // Just sleep to prevent watchdog issues
 }
